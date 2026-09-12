@@ -1,0 +1,214 @@
+// mghost_tests.nv — the version table's SQL, the directory
+// convention, and the one module that touches the machine.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: migrate.<module>.<fn>`.
+// That is the expected result until the bodies land.
+//
+// THE SQL IS ASSERTABLE WITHOUT A DATABASE, which is what
+// `mgstate` producing text rather than running it buys.  The file-name
+// convention is assertable without a filesystem, which is what
+// `parse_name` being separate from `read` buys.  What is left needing
+// a directory gets a refusal against a path that does not exist.
+
+use std.test
+use std.list
+use mgdir
+use mgerror
+use mgplan
+use mgstate
+
+// A path nothing is at.  Named once so the tests say what they are
+// about.
+fn absent_dir() -> Str
+    "/nonexistent/migrate-interface-probe"
+
+@test
+fn test_the_table_name_is_checked_and_not_escaped() [io]
+    // Quoting an identifier is dialect-specific, and query-builder-nv's
+    // own notes record that even sql-engine-nv's tokenizer cannot do
+    // it.  So the name is CHECKED and refused rather than escaped.
+    test.case("the default is the ecosystem's")
+    test.assert(mgstate.default_table() == "schema_migrations")
+    test.assert(mgstate.is_safe_table_name(mgstate.default_table()))
+
+    test.case("letters, digits and underscores pass")
+    test.assert(mgstate.is_safe_table_name("app2_migrations"))
+
+    test.case("a name starting with a digit does not")
+    test.assert(mgstate.is_safe_table_name("2apps") == false)
+
+    test.case("and neither does anything that would need quoting")
+    test.assert(mgstate.is_safe_table_name("schema migrations") == false)
+    test.assert(mgstate.is_safe_table_name("users\"; DROP TABLE users; --") == false)
+    test.assert(mgstate.is_safe_table_name("") == false)
+
+    test.case("so a statement over a bad name is refused rather than built")
+    match mgstate.create_table_sql("schema migrations")
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_statements_are_built_and_not_run() [io]
+    let t = mgstate.default_table()
+
+    test.case("the DDL names the table")
+    match mgstate.create_table_sql(t)
+        Ok(sql) => test.assert(sql != "")
+        Err(_)  => test.assert(false)
+
+    test.case("the select does too")
+    match mgstate.select_sql(t)
+        Ok(sql) => test.assert(sql != "")
+        Err(_)  => test.assert(false)
+
+    test.case("the insert takes the driver's placeholder, because there is no portable one")
+    match mgstate.insert_sql(t, "?")
+        Err(_) => test.assert(false)
+        Ok(a)  =>
+            match mgstate.insert_sql(t, "$1")
+                Err(_) => test.assert(false)
+                Ok(b)  => test.assert(a != b)
+
+    test.case("and so does the delete a rollback uses")
+    match mgstate.delete_sql(t, "?")
+        Ok(sql) => test.assert(sql != "")
+        Err(_)  => test.assert(false)
+
+    test.case("the placeholder styles are named rather than guessed")
+    test.assert(mgstate.placeholder_for("postgres", 1) == "$1")
+    test.assert(mgstate.placeholder_for("sqlite", 1) == "?")
+
+@test
+fn test_the_row_shape_is_a_compatibility_promise() [io]
+    test.case("six columns, in a known order")
+    test.assert(list.len(mgstate.column_names()) == 6)
+
+    test.case("a row with the wrong number of them is refused")
+    // The alternative is reading a checksum out of a timestamp.
+    match mgstate.rows_to_applied([["0001", "create_users"]])
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("and no rows is no migrations, which is not an error")
+    match mgstate.rows_to_applied([])
+        Ok(a)  => test.assert(list.len(a) == 0)
+        Err(_) => test.assert(false)
+
+    test.case("the values to insert are in placeholder order")
+    let m = mgplan.migration("0001", "create_users", "CREATE TABLE t (n INT)", "")
+    test.assert(list.len(mgstate.record_params(m, "2026-09-11T14:30:00Z", 12, true)) == 6)
+
+    test.case("and a step becomes a row with the caller's clock reading")
+    let steps = mgplan.plan([m], [], mgplan.default_options())
+    match steps
+        Err(_) => test.assert(false)
+        Ok(p)  =>
+            match list.first(p.steps)
+                None    => test.assert(false)
+                Some(s) =>
+                    test.assert(mgstate.applied_of_step(s, "2026-09-11T14:30:00Z", 12, true).version
+                                == "0001")
+
+@test
+fn test_two_processes_migrating_at_once_is_asked_about() [io]
+    // The failure nobody tests for, and what happens the first time a
+    // deployment starts three copies of a service at the same moment.
+    test.case("a driver with an advisory lock gets a statement")
+    test.assert(mgstate.lock_sql("postgres", 1) != "")
+    test.assert(mgstate.unlock_sql("postgres", 1) != "")
+
+    test.case("and one without gets an empty answer rather than a pretence")
+    test.assert(mgstate.lock_sql("sqlite", 1) == "")
+
+    test.case("the key is derived from the table, so two applications do not exclude each other")
+    test.assert(mgstate.lock_key_for("schema_migrations")
+                != mgstate.lock_key_for("other_migrations"))
+
+    test.case("and is stable, which is the only property that matters")
+    test.assert(mgstate.lock_key_for("schema_migrations")
+                == mgstate.lock_key_for("schema_migrations"))
+
+@test
+fn test_a_file_name_is_parsed_and_a_bad_one_is_refused_rather_than_skipped() [io]
+    // A migration silently skipped is a migration that runs on one
+    // machine and not on another.
+    test.case("the sequence convention")
+    match mgdir.parse_name("0001_create_users.up.sql", mgdir.MgPaired)
+        Err(_) => test.assert(false)
+        Ok(n)  =>
+            test.assert(n.version == "0001")
+            test.assert(n.name == "create_users")
+
+    test.case("the timestamp convention")
+    match mgdir.parse_name("20260911143000_add_index.up.sql", mgdir.MgPaired)
+        Err(_) => test.assert(false)
+        Ok(n)  => test.assert(n.version == "20260911143000")
+
+    test.case("a single file carries both halves")
+    match mgdir.parse_name("0001_create_users.sql", mgdir.MgSingleFile)
+        Err(_) => test.assert(false)
+        Ok(n)  => test.assert(n.both_halves)
+
+    test.case("and a name with no separator is refused, naming the file")
+    match mgdir.parse_name("readme.txt", mgdir.MgPaired)
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(mgerror.describe(f) != "")
+
+    test.case("the inverse builds the name a `new` command would write")
+    test.assert(mgdir.file_name_for("0001", "create_users", mgplan.MgUp, mgdir.MgPaired)
+                != mgdir.file_name_for("0001", "create_users", mgplan.MgDown, mgdir.MgPaired))
+
+@test
+fn test_the_markers_report_what_they_found_rather_than_assuming() [io]
+    // A file with a MISTYPED marker is the same shape as a file with
+    // no `down`, and the only defence is that a caller can see which
+    // markers were actually present.
+    test.case("the markers are the ecosystem's spelling")
+    test.assert(mgdir.up_marker() == "-- +migrate Up")
+    test.assert(mgdir.down_marker() == "-- +migrate Down")
+
+    test.case("both sections are found when both markers are there")
+    let both = mgdir.split_markers("-- +migrate Up\nCREATE TABLE t (n INT);\n-- +migrate Down\nDROP TABLE t;\n")
+    test.assert(both.saw_up_marker)
+    test.assert(both.saw_down_marker)
+    test.assert(both.up != "")
+    test.assert(both.down != "")
+
+    test.case("a file with no down marker has no down, and says the marker was missing")
+    let up_only = mgdir.split_markers("-- +migrate Up\nCREATE TABLE t (n INT);\n")
+    test.assert(up_only.saw_up_marker)
+    test.assert(up_only.saw_down_marker == false)
+    test.assert(up_only.down == "")
+
+    test.case("and a file with NO markers is all up, which is what every tool does")
+    let bare = mgdir.split_markers("CREATE TABLE t (n INT);\n")
+    test.assert(bare.saw_up_marker == false)
+    test.assert(bare.up != "")
+
+@test
+fn test_reading_a_directory_that_is_not_there_refuses() [io, fs]
+    test.case("detecting a layout")
+    match mgdir.detect(absent_dir())
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("reading with a layout named")
+    match mgdir.read(absent_dir(), mgdir.MgPaired)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("reading with the layout guessed")
+    match mgdir.read_auto(absent_dir())
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("asking for the next sequence")
+    match mgdir.next_sequence(absent_dir())
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("and creating one")
+    match mgdir.create(absent_dir(), "0001", "create_users", mgdir.MgPaired)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)

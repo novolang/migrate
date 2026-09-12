@@ -1,0 +1,74 @@
+[package]
+name        = "migrate"
+version     = "0.0.1"
+description = "Versioned schema migrations for std.sql drivers: a migration is a value, a plan is a value, and running one is the caller's loop.  The applied-versions table with checksums, up/down/redo/status, a dry run that is the same call as a real one, and a plan that refuses before it runs when a checksum has changed.  Interface only — every body is a todo()."
+license     = "Apache-2.0"
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `host`, and EXACTLY ONE module earns it: `mgdir`, which reads a
+# directory of `.sql` files.  `mgplan`, `mgstate` and `mgerror` are
+# `[]` throughout.
+#
+# The package does not run anything, and that is not a limitation
+# worked around — it is what the language currently permits and what
+# the design wants anyway.  A library that called `dyn Database` would
+# be charged the UNION of every `Database` impl in the CONSUMING
+# program (SPEC § 5.6), which a library cannot know: a program holding
+# only the standard library's `SqliteDb` makes that call `[fs, io]`,
+# and adding postgres-nv makes it `[fs, io, net, time]` and stops the
+# library compiling.  So `mgplan.plan` answers the ORDERED STATEMENTS
+# and the caller executes them against whatever it holds — which is
+# also what makes a migration plan testable with no database, no file
+# and no clock.  The README names the contract change that would let
+# this package offer a convenience runner on top.
+layer       = "host"
+
+category    = "databases"
+
+tags        = ["migrations", "schema", "sql", "database", "sqlx", "alembic", "versioning"]
+repository  = "https://github.com/novolang/migrate"
+maintainers = ["novo-lang"]
+novo        = ">= 0.8.9"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "A migration is a value, and so is the plan that refuses to run one"
+
+[dependencies]
+# crypto-nv, for SHA-256, and it is the whole reason this package can
+# refuse anything.  A migration's checksum is what makes "this file
+# has been edited since it was applied" a question with an answer;
+# without it, a migration directory is a list of names and an editor
+# is free to change what version 7 means on one machine and not on
+# another.  `hashing.sha256` computes it and `digest.ct_eq` compares
+# it — not because an attacker is involved, but because one comparison
+# function on the grid is better than two.
+crypto-nv = "^0.1.1"
+
+# NOT semver-nv, and the reason is the one the plan asked for in
+# writing.  changelog-nv takes semver-nv because a release version is
+# a SEMANTIC VERSION: three numbers with rules about which one moves
+# when, a pre-release ordering, and a caret range that decides
+# compatibility.  A SCHEMA VERSION IS A SEQUENCE.  It is `20260911143000`
+# or `0007`, it compares by ordinary ordering, it has no pre-release
+# and no build metadata, nothing is "compatible" with it, and the only
+# question ever asked of two of them is which came first.  Modelling
+# it as a semantic version would invite exactly the question that has
+# no meaning here — whether migration 2.0.0 is a breaking change — and
+# would make `1.10` sort below `1.9` for anybody who wrote a version
+# with a dot in it.  `MgVersion` is a `Str` compared by `compare`,
+# which is where the sequence's own rule lives.
+#
+# NOT sql-engine-nv either.  This package does not parse SQL: a
+# migration's body is text the driver runs, and a parser here would
+# refuse valid statements for whichever dialect it did not implement
+# while adding nothing — the driver is going to parse it anyway, and
+# its error message is the one a caller can act on.

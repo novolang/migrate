@@ -1,0 +1,372 @@
+// mgplan.nv — a migration is a value, a plan is a value, and running
+// one is the caller's loop.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THIS MODULE IS THE PACKAGE'S LOAD-BEARING INTERFACE, and it is one
+// function: `plan`.  It takes what the directory holds and what the
+// database has applied, and answers an ORDERED LIST OF STATEMENTS — or
+// a fault.  It runs nothing.
+//
+// WHY A PLAN RATHER THAN A RUNNER, and there are two reasons.
+//
+// The first is the language, today.  A library that called `dyn
+// Database` is charged the UNION of every `Database` impl in the
+// CONSUMING program (SPEC § 5.6) — a program holding only the standard
+// library's `SqliteDb` makes that call `[fs, io]`, and adding
+// postgres-nv makes it `[fs, io, net, time]`.  A library cannot
+// declare a row that depends on what its consumer links, so a
+// migration runner that owned the loop would be a library that stops
+// compiling when somebody adds an engine.  The README names the
+// contract change that would lift this.
+//
+// The second is that it is the better design regardless.  A plan is a
+// VALUE, so:
+//
+//   * a DRY RUN is the same call as a real one.  There is no second
+//     code path, which means the thing a deployment reviews and the
+//     thing that runs cannot drift apart — and "dry run works, the
+//     real one does not" is the failure mode every migration tool
+//     with two paths has;
+//   * every REFUSAL happens before the first statement.  A runner
+//     that discovered a changed checksum halfway has left half of
+//     version 7 applied and version 7 unrecorded;
+//   * the ORDER is assertable.  `tests/mgplan_tests.nv` builds a
+//     directory's worth of migrations, applies some, and asserts on
+//     what would run — with no database, no file and no clock.
+//
+// A VERSION IS A SEQUENCE AND NOT A SEMANTIC VERSION.  `20260911143000`
+// or `0007`: it compares by ordinary ordering, it has no pre-release,
+// nothing is "compatible" with it, and the only question ever asked of
+// two of them is which came first.  `compare_versions` is that rule
+// and it is public, because the one thing that would break it is
+// comparing `"10"` and `"9"` as text — which sorts `10` first and
+// runs the migrations in the wrong order on exactly the tenth one.
+//
+// AN UP AND A DOWN ARE NOT SYMMETRIC.  Most migrations have a down and
+// some genuinely cannot: a `DROP COLUMN` has no inverse that keeps the
+// data.  `MgMigration.down` being empty is that statement, and
+// `MgIrreversible` is what a rollback through it answers — BEFORE it
+// starts, so a rollback that would stop halfway does not start.
+
+use mgerror
+
+// Which way a migration is being applied.
+pub enum MgDirection
+    MgUp
+    MgDown
+
+// One migration.
+//
+// A VALUE, which is what lets a caller build one in a test, hold a
+// directory's worth in memory, and hash them without a database.
+pub struct MgMigration
+    // The version, as a sequence — see the module comment.
+    version: Str
+    // A human name, from the file name: `create_users`.
+    name: Str
+    // The statements that apply it.  Text, because a driver is going
+    // to parse it and this package has no business doing so first.
+    up: Str
+    // The statements that undo it, or empty when it cannot be undone.
+    // NOT symmetric with `up` — see the module comment.
+    down: Str
+    // The SHA-256 of `up`, as lowercase hex.  Of `up` ALONE: editing
+    // a `down` that has never run changes nothing that has happened,
+    // and refusing for it would make fixing a broken rollback
+    // impossible without rewriting history.
+    checksum: Str
+
+// A migration that has been applied, as the version table records it.
+pub struct MgApplied
+    version: Str
+    name: Str
+    // The checksum as it was WHEN IT RAN.  Compared with the file's
+    // now — see `mgerror.MgChecksumChanged`.
+    checksum: Str
+    // When it ran, as the caller's clock recorded it.  Text rather
+    // than a timestamp type, because this package has no clock and
+    // because what the column holds is the DRIVER's rendering of one.
+    applied_at: Str
+    // How long it took, in milliseconds, or 0 when the runner did not
+    // measure.  Carried because "which migration is the slow one" is
+    // the question asked the first time a deployment takes an hour.
+    took_ms: Int
+    // False when the migration failed and was recorded anyway, which
+    // is what a runner does when a statement fails partway through a
+    // migration the driver did not run in a transaction.  A version
+    // table with a `false` in it is a database a person has to look
+    // at, and recording it is better than leaving no trace.
+    succeeded: Bool
+
+// One statement to run, in order.
+pub struct MgStep
+    version: Str
+    name: Str
+    direction: MgDirection
+    // The statement text.  One `MgStep` per MIGRATION and not per
+    // statement: splitting SQL into statements needs a parser, and
+    // this package does not have one and should not — see the
+    // manifest.  A driver that cannot run several statements in one
+    // call is one whose caller splits, and it will have to know the
+    // dialect to do it.
+    sql: Str
+    // The checksum to record, for an up; empty for a down.
+    checksum: Str
+
+// What a plan would do.
+pub struct MgPlan
+    steps: [MgStep]
+    // The version the database is at now, or empty when nothing has
+    // been applied.
+    current: Str
+    // The version it would be at afterwards.
+    target: Str
+    direction: MgDirection
+
+// What a plan is allowed to do.
+pub struct MgPlanOptions
+    // Allow a migration whose version is below the highest applied.
+    // FALSE by default: two developers branching and merging in
+    // either order would otherwise produce a schema whose final shape
+    // depends on which of them merged second.
+    allow_out_of_order: Bool
+    // Stop at this version instead of the last one.  Empty for all of
+    // them.
+    target: Str
+    // Apply at most this many.  Zero for no limit.  What a cautious
+    // deployment uses to go one at a time.
+    limit: Int
+    // Record a migration that failed partway, rather than leaving no
+    // trace — see `MgApplied.succeeded`.
+    record_failures: Bool
+
+// The defaults: in order, all of them, recording failures.
+//
+// ```novo
+// use mgplan
+//
+// fn main() [io]
+//     println("${mgplan.default_options().allow_out_of_order}")
+// ```
+pub fn default_options() -> MgPlanOptions
+    todo("migrate.mgplan.default_options")
+
+// ── versions ─────────────────────────────────────────────────────────
+
+// Compare two versions as SEQUENCES.
+//
+// Negative, zero or positive.  The one rule that matters: a version
+// that is all digits compares NUMERICALLY, so `"10"` is after `"9"`.
+// Comparing them as text sorts `10` first and runs the migrations in
+// the wrong order on exactly the tenth one — which is late enough
+// that every test suite has passed.
+//
+// A version that is not all digits compares lexically, which is right
+// for the timestamp convention (`20260911143000`) because those are
+// all digits too, and is at least predictable for anything else.
+//
+// ```novo
+// use mgplan
+//
+// fn main() [io]
+//     println("${mgplan.compare_versions("9", "10")}")
+// ```
+pub fn compare_versions(a: Str, b: Str) -> Int
+    todo("migrate.mgplan.compare_versions")
+
+// Migrations sorted by version.
+//
+// ```novo
+// use mgplan
+// use std.list
+//
+// fn main() [io]
+//     println("${list.len(mgplan.sorted([]))}")
+// ```
+pub fn sorted(ms: [MgMigration]) -> [MgMigration]
+    todo("migrate.mgplan.sorted")
+
+// ── building a migration ─────────────────────────────────────────────
+
+// A migration from its parts, with its checksum computed.
+//
+// ```novo
+// use mgplan
+//
+// fn main() [io]
+//     println(mgplan.migration("0001", "create_users", "CREATE TABLE users (id INT)", "").version)
+// ```
+pub fn migration(version: Str, name: Str, up: Str, down: Str) -> MgMigration
+    todo("migrate.mgplan.migration")
+
+// The checksum of a migration's `up`.
+//
+// SHA-256, lowercase hex.  Public because a caller that stores
+// migrations somewhere other than a directory — in a table, in a
+// binary, in a package — computes the same digest, and because a
+// report about a changed checksum is more useful when a reader can
+// recompute it.
+//
+// OF `up` ALONE — see `MgMigration.checksum` for why.
+//
+// ```novo
+// use mgplan
+//
+// fn main() [io]
+//     println(mgplan.checksum_of("CREATE TABLE t (n INT)"))
+// ```
+pub fn checksum_of(up: Str) -> Str
+    todo("migrate.mgplan.checksum_of")
+
+// True when this migration can be rolled back.
+pub fn is_reversible(m: MgMigration) -> Bool
+    todo("migrate.mgplan.is_reversible")
+
+// ── the plan ─────────────────────────────────────────────────────────
+
+// What would run, in order — or the fault that stops it.
+//
+// THE PACKAGE'S LOAD-BEARING INTERFACE — see the module comment.
+// Every refusal happens here, before the first statement: a changed
+// checksum, a duplicate version, an out-of-order arrival, an applied
+// migration whose file is gone.
+//
+// ```novo
+// use mgplan
+// use std.list
+//
+// fn main() [io]
+//     match mgplan.plan([], [], mgplan.default_options())
+//         Ok(p)  => println("${list.len(p.steps)} to run")
+//         Err(f) => println("refused before anything ran")
+// ```
+pub fn plan(available: [MgMigration], applied: [MgApplied],
+            options: MgPlanOptions) -> Result<MgPlan, mgerror.MgFault>
+    todo("migrate.mgplan.plan")
+
+// What a rollback would run, in reverse order — or the fault.
+//
+// `target` is the version to roll back TO, exclusive: rolling back to
+// `"0003"` leaves 3 applied and undoes everything after it.  An empty
+// target undoes everything.
+//
+// Refuses BEFORE the first statement when any migration in the range
+// is irreversible, which is the point: a rollback that stopped
+// halfway would leave a schema nobody has a name for.
+//
+// ```novo
+// use mgplan
+// use std.list
+//
+// fn main() [io]
+//     match mgplan.plan_down([], [], "", mgplan.default_options())
+//         Ok(p)  => println("${list.len(p.steps)} to undo")
+//         Err(f) => println("refused before anything ran")
+// ```
+pub fn plan_down(available: [MgMigration], applied: [MgApplied], target: Str,
+                 options: MgPlanOptions) -> Result<MgPlan, mgerror.MgFault>
+    todo("migrate.mgplan.plan_down")
+
+// What a redo would run: the last applied migration down, then up.
+//
+// The development loop, and the one place `down` gets exercised often
+// enough to be trusted.  A tool whose `down` is only ever run in
+// anger is one whose `down` does not work.
+pub fn plan_redo(available: [MgMigration], applied: [MgApplied],
+                 options: MgPlanOptions) -> Result<MgPlan, mgerror.MgFault>
+    todo("migrate.mgplan.plan_redo")
+
+// True when the plan would do nothing.
+//
+// What a deployment checks to decide whether to take the lock at all.
+//
+// ```novo
+// use mgplan
+//
+// fn main() [io]
+//     match mgplan.plan([], [], mgplan.default_options())
+//         Err(_) => println("refused")
+//         Ok(p)  => println("${mgplan.is_empty(p)}")
+// ```
+pub fn is_empty(p: MgPlan) -> Bool
+    todo("migrate.mgplan.is_empty")
+
+// The plan rendered as lines a person reads before approving it.
+//
+// The DRY RUN, and it is the same plan the real run uses — there is
+// no second code path, which is what stops "dry run works, the real
+// one does not" — see the module comment.
+//
+// Lines and not a printed page: a library returns text, and the
+// program decides where it goes.
+//
+// ```novo
+// use mgplan
+// use std.list
+//
+// fn main() [io]
+//     match mgplan.plan([], [], mgplan.default_options())
+//         Err(_) => println("refused")
+//         Ok(p)  => println("${list.len(mgplan.render(p))}")
+// ```
+pub fn render(p: MgPlan) -> [Str]
+    todo("migrate.mgplan.render")
+
+// ── status ───────────────────────────────────────────────────────────
+
+// Where one migration stands.
+pub enum MgStatus
+    // In the directory and not in the version table.
+    MgPending
+    // In both, and the checksums agree.
+    //
+    // Named `MgDone` and not `MgApplied` because `MgApplied` is
+    // already a STRUCT in this module, and a variant that shares a
+    // type's name is one a consumer's `match` arm binds by accident.
+    MgDone
+    // In both, and the checksums do NOT — see
+    // `mgerror.MgChecksumChanged`.
+    MgModified
+    // In the version table and not in the directory.
+    MgOrphaned
+    // In both, and recorded as having failed.
+    MgFailed
+
+// One row of a status report.
+pub struct MgStatusRow
+    version: Str
+    name: Str
+    status: MgStatus
+    applied_at: Str
+
+// Every migration and where it stands.
+//
+// Answers rather than refuses: `status` is the call a person makes
+// when something is already wrong, so a changed checksum has to be
+// REPORTABLE rather than raised — `MgModified` is a row here and
+// `MgChecksumChanged` is what `plan` raises for the same fact.
+//
+// ```novo
+// use mgplan
+// use std.list
+//
+// fn main() [io]
+//     println("${list.len(mgplan.status([], []))}")
+// ```
+pub fn status(available: [MgMigration], applied: [MgApplied]) -> [MgStatusRow]
+    todo("migrate.mgplan.status")
+
+// The highest version applied, or empty.
+pub fn current_version(applied: [MgApplied]) -> Str
+    todo("migrate.mgplan.current_version")
+
+// True when nothing is pending and nothing is modified.
+//
+// The question a health check asks.
+pub fn is_up_to_date(available: [MgMigration], applied: [MgApplied]) -> Bool
+    todo("migrate.mgplan.is_up_to_date")
+
+// One line per status row, for a report a person reads.
+pub fn render_status(rows: [MgStatusRow]) -> [Str]
+    todo("migrate.mgplan.render_status")

@@ -1,0 +1,241 @@
+// mgplan_tests.nv — the plan, and the refusals that happen before the
+// first statement.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: migrate.<module>.<fn>`.
+// That is the expected result until the bodies land.
+//
+// EVERY ASSERTION HERE RUNS WITHOUT A DATABASE, which is the property
+// the plan-as-a-value design was chosen for.  A migration tool's
+// interesting behaviour is its refusals, and a test that needed a
+// database to check a refusal is a test nobody runs on every commit.
+
+use std.test
+use std.list
+use mgerror
+use mgplan
+
+// Three migrations, built in a test rather than read from anywhere.
+fn m1() -> mgplan.MgMigration
+    mgplan.migration("0001", "create_users", "CREATE TABLE users (id INT)",
+                     "DROP TABLE users")
+
+fn m2() -> mgplan.MgMigration
+    mgplan.migration("0002", "add_email", "ALTER TABLE users ADD COLUMN email TEXT",
+                     "ALTER TABLE users DROP COLUMN email")
+
+// Irreversible on purpose: a DROP COLUMN has no inverse that keeps the
+// data, and saying so is a design decision rather than an omission.
+fn m3() -> mgplan.MgMigration
+    mgplan.migration("0010", "drop_legacy", "ALTER TABLE users DROP COLUMN legacy", "")
+
+fn applied_m1() -> mgplan.MgApplied
+    MgApplied { version: "0001", name: "create_users",
+                       checksum: m1().checksum, applied_at: "2026-09-11T14:30:00Z",
+                       took_ms: 12, succeeded: true }
+
+@test
+fn test_a_version_is_a_sequence_and_ten_comes_after_nine() [io]
+    // THE ASSERTION THAT CATCHES THE LATE BUG.  Comparing versions as
+    // text sorts `10` before `9` and runs the migrations in the wrong
+    // order on exactly the tenth one — which is late enough that every
+    // test suite has passed.
+    test.case("nine is before ten")
+    test.assert(mgplan.compare_versions("9", "10") < 0)
+
+    test.case("and ten is after nine, in both directions")
+    test.assert(mgplan.compare_versions("10", "9") > 0)
+
+    test.case("a version equals itself")
+    test.assert(mgplan.compare_versions("0007", "0007") == 0)
+
+    test.case("zero padding does not change the answer")
+    test.assert(mgplan.compare_versions("0009", "10") < 0)
+
+    test.case("and the timestamp convention orders correctly too")
+    test.assert(mgplan.compare_versions("20260911143000", "20260912090000") < 0)
+
+@test
+fn test_a_migration_carries_its_own_checksum_over_its_up_alone() [io]
+    let m = m1()
+
+    test.case("the checksum is there and is not empty")
+    test.assert(m.checksum != "")
+    test.assert(m.checksum == mgplan.checksum_of(m.up))
+
+    test.case("a different up gives a different checksum")
+    test.assert(mgplan.checksum_of("CREATE TABLE a (n INT)")
+                != mgplan.checksum_of("CREATE TABLE b (n INT)"))
+
+    test.case("and a changed DOWN does not change it")
+    // Editing a `down` that has never run changes nothing that has
+    // happened; refusing for it would make fixing a broken rollback
+    // impossible without rewriting history.
+    let same_up = mgplan.migration("0001", "create_users",
+                                   "CREATE TABLE users (id INT)", "DROP TABLE users CASCADE")
+    test.assert(same_up.checksum == m.checksum)
+
+    test.case("a migration with no down says so")
+    test.assert(mgplan.is_reversible(m1()))
+    test.assert(mgplan.is_reversible(m3()) == false)
+
+@test
+fn test_a_plan_over_an_empty_database_runs_everything_in_order() [io]
+    match mgplan.plan([m2(), m1()], [], mgplan.default_options())
+        Err(_) => test.assert(false)
+        Ok(p)  =>
+            test.case("both of them, sorted despite the order they came in")
+            test.assert(list.len(p.steps) == 2)
+
+            test.case("and the plan says where it starts and ends")
+            test.assert(p.current == "")
+            test.assert(p.target == "0002")
+
+            test.case("it is not empty")
+            test.assert(mgplan.is_empty(p) == false)
+
+            test.case("and it renders for a person to approve — the same plan that runs")
+            test.assert(list.len(mgplan.render(p)) > 0)
+
+@test
+fn test_a_plan_over_an_up_to_date_database_does_nothing() [io]
+    match mgplan.plan([m1()], [applied_m1()], mgplan.default_options())
+        Err(_) => test.assert(false)
+        Ok(p)  =>
+            test.case("nothing to run")
+            test.assert(list.len(p.steps) == 0)
+            test.assert(mgplan.is_empty(p))
+
+            test.case("and the current version is what was applied")
+            test.assert(p.current == "0001")
+
+    test.case("which the health check agrees with")
+    test.assert(mgplan.is_up_to_date([m1()], [applied_m1()]))
+    test.assert(mgplan.is_up_to_date([m1(), m2()], [applied_m1()]) == false)
+
+    test.case("and the current version is readable on its own")
+    test.assert(mgplan.current_version([applied_m1()]) == "0001")
+    test.assert(mgplan.current_version([]) == "")
+
+@test
+fn test_an_edited_migration_is_refused_before_anything_runs() [io]
+    // THE REFUSAL THIS PACKAGE EXISTS FOR.  A migration applied and
+    // then edited is invisible: the developer who edited it has the
+    // new schema because they re-ran from scratch, every machine that
+    // applied the old one has the old schema, and the version table
+    // says both are up to date.
+    let edited = mgplan.migration("0001", "create_users",
+                                  "CREATE TABLE users (id INT, name TEXT)", "DROP TABLE users")
+
+    test.case("the checksums disagree")
+    test.assert(edited.checksum != applied_m1().checksum)
+
+    test.case("so the plan refuses, and refuses BEFORE the first statement")
+    match mgplan.plan([edited, m2()], [applied_m1()], mgplan.default_options())
+        Ok(_)  => test.assert(false)
+        Err(f) =>
+            test.assert(mgerror.version_of(f) == "0001")
+            test.assert(mgerror.needs_a_person(f))
+
+    test.case("and status REPORTS the same fact rather than raising it")
+    // `status` is the call a person makes when something is already
+    // wrong, so a changed checksum has to be reportable.
+    test.assert(list.len(mgplan.status([edited], [applied_m1()])) == 1)
+    test.assert(list.len(mgplan.render_status(mgplan.status([edited], [applied_m1()]))) == 1)
+
+@test
+fn test_the_other_three_refusals_are_also_before_anything_runs() [io]
+    test.case("two migrations with one version, because one would never run")
+    let clash = mgplan.migration("0001", "other", "CREATE TABLE other (n INT)", "")
+    match mgplan.plan([m1(), clash], [], mgplan.default_options())
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(mgerror.needs_a_person(f))
+
+    test.case("a migration below the highest applied, by default")
+    // Two developers branched and merged in either order; the schema's
+    // final shape must not depend on which merged second.
+    let late = mgplan.migration("0000", "earlier", "CREATE TABLE early (n INT)", "")
+    match mgplan.plan([m1(), late], [applied_m1()], mgplan.default_options())
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(mgerror.needs_a_person(f))
+
+    test.case("an applied migration whose file is gone")
+    match mgplan.plan([m2()], [applied_m1()], mgplan.default_options())
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(mgerror.needs_a_person(f))
+
+    test.case("and every one of them renders for a report")
+    test.assert(mgerror.describe(mgerror.MgIrreversible(version: "0010")) != "")
+    test.assert(mgerror.describe(mgerror.MgIoFailed(operation: "read", path: "x")) != "")
+
+    test.case("while an I/O failure is NOT a thing a person has to decide")
+    test.assert(mgerror.needs_a_person(mgerror.MgIoFailed(operation: "read", path: "x")) == false)
+    test.assert(mgerror.version_of(mgerror.MgIoFailed(operation: "read", path: "x")) == "")
+
+@test
+fn test_out_of_order_is_a_policy_and_not_a_law() [io]
+    let late = mgplan.migration("0000", "earlier", "CREATE TABLE early (n INT)", "")
+    let d = mgplan.default_options()
+    let permissive = MgPlanOptions { allow_out_of_order: true, target: d.target,
+                                            limit: d.limit, record_failures: d.record_failures }
+
+    test.case("the default refuses")
+    test.assert(d.allow_out_of_order == false)
+
+    test.case("and saying so allows it")
+    match mgplan.plan([m1(), late], [applied_m1()], permissive)
+        Ok(p)  => test.assert(list.len(p.steps) == 1)
+        Err(_) => test.assert(false)
+
+@test
+fn test_a_rollback_through_something_irreversible_does_not_start() [io]
+    // A rollback that stopped halfway would leave a schema nobody has
+    // a name for.
+    let applied_all = [applied_m1(),
+                       MgApplied { version: "0010", name: "drop_legacy",
+                                          checksum: m3().checksum,
+                                          applied_at: "2026-09-11T15:00:00Z",
+                                          took_ms: 3, succeeded: true }]
+
+    test.case("rolling back past an irreversible migration is refused")
+    match mgplan.plan_down([m1(), m3()], applied_all, "0001", mgplan.default_options())
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(mgerror.version_of(f) == "0010")
+
+    test.case("and rolling back a reversible one is not")
+    match mgplan.plan_down([m1()], [applied_m1()], "", mgplan.default_options())
+        Err(_) => test.assert(false)
+        Ok(p)  =>
+            test.assert(list.len(p.steps) == 1)
+            match p.direction
+                MgDown => test.assert(true)
+                MgUp   => test.assert(false)
+
+    test.case("a redo is a down and then an up, which is where down gets exercised")
+    match mgplan.plan_redo([m1()], [applied_m1()], mgplan.default_options())
+        Ok(p)  => test.assert(list.len(p.steps) == 2)
+        Err(_) => test.assert(false)
+
+@test
+fn test_the_plan_is_limited_and_targeted_when_it_is_told_to_be() [io]
+    let d = mgplan.default_options()
+    let one_at_a_time = MgPlanOptions { allow_out_of_order: d.allow_out_of_order,
+                                               target: "", limit: 1,
+                                               record_failures: d.record_failures }
+
+    test.case("a limit stops it short, which is what a cautious deployment uses")
+    match mgplan.plan([m1(), m2()], [], one_at_a_time)
+        Ok(p)  => test.assert(list.len(p.steps) == 1)
+        Err(_) => test.assert(false)
+
+    let up_to_one = MgPlanOptions { allow_out_of_order: d.allow_out_of_order,
+                                           target: "0001", limit: 0,
+                                           record_failures: d.record_failures }
+
+    test.case("and a target does too")
+    match mgplan.plan([m1(), m2()], [], up_to_one)
+        Ok(p)  => test.assert(p.target == "0001")
+        Err(_) => test.assert(false)
+
+    test.case("sorting is available on its own, because a caller may hold its own list")
+    test.assert(list.len(mgplan.sorted([m2(), m1()])) == 2)

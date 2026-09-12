@@ -1,0 +1,228 @@
+// mgdir.nv — the directory convention, and the only module in this
+// package that touches the machine.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// `[fs]` AND NOTHING ELSE.  `std.fs` lists a directory and reads a
+// file, and both are `[fs]`.  Nothing here prints — a library returns
+// text and the program decides where it goes — and nothing here
+// connects to a database, because this package runs nothing (see
+// `mgplan`'s module comment).
+//
+// TWO CONVENTIONS, BECAUSE THE ECOSYSTEM HAS TWO and a port that
+// picked one could not read the other's directory.
+//
+//   PAIRED — `V<version>__<name>.up.sql` and `.down.sql`, or
+//            `<version>_<name>.up.sql` / `.down.sql`.  Two files per
+//            migration, which is sqlx's default and is the one where
+//            a `down` is a first-class file rather than a comment.
+//   SINGLE — `<version>_<name>.sql` with `-- +migrate Up` and
+//            `-- +migrate Down` marker lines inside it.  One file,
+//            which keeps a migration and its inverse in one place —
+//            and which means a marker typo silently produces a
+//            migration with no `down`, so `MgSingleFile` parsing
+//            reports what it found rather than assuming.
+//
+// `MgLayout` is the choice, it is an ARGUMENT, and `detect` will
+// guess from what a directory contains — because the realistic first
+// use of this package is pointing it at a directory somebody else
+// created.
+//
+// A VERSION IS EVERYTHING BEFORE THE FIRST SEPARATOR, and the
+// separator is `__` or `_`.  `0001_create_users.sql` is version
+// `0001` and name `create_users`; `V2__add_index.up.sql` is version
+// `2` and name `add_index`.  A file that does not match is
+// `MgBadFileName` NAMING THE FILE, rather than being skipped: a
+// migration silently skipped is a migration that runs on one machine
+// and not on another, which is the class of failure this whole
+// package exists to make impossible.
+//
+// THE READ IS SORTED BY `mgplan.compare_versions` AND NOT BY THE
+// DIRECTORY.  A filesystem answers names in whatever order it likes,
+// and even a sorted one puts `10` before `9`.
+
+use mgerror
+use mgplan
+
+// Which naming convention a directory uses.
+pub enum MgLayout
+    // Two files per migration: `.up.sql` and `.down.sql`.
+    MgPaired
+    // One file per migration, with `-- +migrate Up` and
+    // `-- +migrate Down` markers inside.
+    MgSingleFile
+
+// What one file name parsed to.
+pub struct MgFileName
+    version: Str
+    name: Str
+    // For `MgPaired`: which half this file is.  `MgUp` for a single
+    // file, which carries both.
+    direction: mgplan.MgDirection
+    // True when this is a single-file migration carrying both halves.
+    both_halves: Bool
+
+// ── the convention ───────────────────────────────────────────────────
+
+// The marker that opens the `up` section of a single file.
+//
+// `-- +migrate Up`, which is sql-migrate's and goose's spelling.  A
+// function rather than a constant so a caller reading somebody else's
+// directory can see exactly what is being looked for.
+//
+// ```novo
+// use mgdir
+//
+// fn main() [io]
+//     println(mgdir.up_marker())
+// ```
+pub fn up_marker() -> Str
+    todo("migrate.mgdir.up_marker")
+
+// The marker that opens the `down` section.
+pub fn down_marker() -> Str
+    todo("migrate.mgdir.down_marker")
+
+// Parse one file name.
+//
+// Refuses rather than skipping — see the module comment.  A file with
+// no separator, an empty version, or an extension this package does
+// not know is `MgBadFileName` naming the file.
+//
+// ```novo
+// use mgdir
+//
+// fn main() [io]
+//     match mgdir.parse_name("0001_create_users.up.sql", mgdir.MgPaired)
+//         Ok(n)  => println(n.version)
+//         Err(_) => println("not a migration file name")
+// ```
+pub fn parse_name(name: Str, layout: MgLayout) -> Result<MgFileName, mgerror.MgFault>
+    todo("migrate.mgdir.parse_name")
+
+// The file name a migration would be written as.
+//
+// The inverse of `parse_name`, and what a `migrate new` command would
+// use.  Published so that a tool creating migrations and a tool
+// reading them cannot disagree about the convention.
+pub fn file_name_for(version: Str, name: Str, direction: mgplan.MgDirection,
+                     layout: MgLayout) -> Str
+    todo("migrate.mgdir.file_name_for")
+
+// Split a single file's contents at its markers.
+//
+// REPORTS WHAT IT FOUND rather than assuming — see the module
+// comment.  A file with no `down` marker is a migration with no
+// `down`, which is legitimate; a file with a MISTYPED one is the same
+// thing, and the only defence is that a caller can see the two
+// sections' lengths.
+//
+// ```novo
+// use mgdir
+//
+// fn main() [io]
+//     let s = mgdir.split_markers("-- +migrate Up\nCREATE TABLE t (n INT);\n")
+//     println("${s.saw_down_marker}")
+// ```
+pub struct MgSections
+    up: Str
+    down: Str
+    // Whether each marker was actually present.  A file with NEITHER
+    // marker is treated as all `up`, which is what every tool does and
+    // is why the flags exist: a caller that wants to insist on markers
+    // can.
+    saw_up_marker: Bool
+    saw_down_marker: Bool
+
+// Split.
+pub fn split_markers(contents: Str) -> MgSections
+    todo("migrate.mgdir.split_markers")
+
+// ── reading a directory ──────────────────────────────────────────────
+
+// Which layout a directory appears to use.
+//
+// Guesses from what is in it: any `.up.sql` means `MgPaired`,
+// otherwise `MgSingleFile`.  The realistic first use of this package
+// is pointing it at a directory somebody else created, so guessing is
+// worth doing — and it is a separate call from `read`, so a caller
+// that knows can say.
+//
+// ```novo
+// use mgdir
+//
+// fn main() [io, fs]
+//     match mgdir.detect("migrations")
+//         Ok(l)  => println("a layout")
+//         Err(_) => println("could not read the directory")
+// ```
+pub fn detect(path: Str) -> Result<MgLayout, mgerror.MgFault> [fs]
+    todo("migrate.mgdir.detect")
+
+// Read a directory of migrations.
+//
+// Sorted by `mgplan.compare_versions` and not by the directory — see
+// the module comment.  Every file's checksum is computed here, which
+// is what `mgplan.plan` then compares against the version table.
+//
+// A file that does not parse stops the read: a migration silently
+// skipped is a migration that runs on one machine and not on another.
+//
+// ```novo
+// use mgdir
+// use std.list
+//
+// fn main() [io, fs]
+//     match mgdir.read("migrations", mgdir.MgPaired)
+//         Ok(ms) => println("${list.len(ms)}")
+//         Err(_) => println("could not read them")
+// ```
+pub fn read(path: Str, layout: MgLayout) -> Result<[mgplan.MgMigration], mgerror.MgFault> [fs]
+    todo("migrate.mgdir.read")
+
+// Read a directory, guessing the layout first.
+//
+// The one-call convenience, and what most callers want.
+pub fn read_auto(path: Str) -> Result<[mgplan.MgMigration], mgerror.MgFault> [fs]
+    todo("migrate.mgdir.read_auto")
+
+// Write a new, empty migration into a directory, answering the paths
+// it created.
+//
+// The `migrate new` half.  It does NOT invent a version: `version` is
+// the caller's, because the two conventions — a timestamp and a
+// sequence — are a choice, and a package with no clock cannot make
+// the first of them anyway.
+//
+// ```novo
+// use mgdir
+// use mgplan
+// use std.list
+//
+// fn main() [io, fs]
+//     match mgdir.create(".", "0001", "create_users", mgdir.MgPaired)
+//         Ok(ps) => println("${list.len(ps)}")
+//         Err(_) => println("could not write")
+// ```
+pub fn create(path: Str, version: Str, name: Str,
+              layout: MgLayout) -> Result<[Str], mgerror.MgFault> [fs]
+    todo("migrate.mgdir.create")
+
+// The next sequence version for a directory: one past the highest it
+// holds, zero-padded to the same width.
+//
+// For the sequence convention only.  A caller using timestamps takes
+// one from its own clock, which this package does not have — and
+// which is the reason this function exists rather than a general
+// `next_version`.
+//
+// ```novo
+// use mgdir
+//
+// fn main() [io, fs]
+//     match mgdir.next_sequence("migrations")
+//         Ok(v)  => println(v)
+//         Err(_) => println("could not read the directory")
+// ```
+pub fn next_sequence(path: Str) -> Result<Str, mgerror.MgFault> [fs]
+    todo("migrate.mgdir.next_sequence")

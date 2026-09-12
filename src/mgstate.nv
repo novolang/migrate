@@ -1,0 +1,260 @@
+// mgstate.nv — the applied-versions table: the SQL that makes it, the
+// SQL that reads it, and the parsing of what comes back.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THIS MODULE PRODUCES SQL AND PARSES ROWS.  It does not run anything
+// — `mgplan`'s module comment says why, and the short version is that
+// a library calling `dyn Database` is charged the union of every
+// engine impl in the CONSUMING program, which a library cannot know.
+// So the caller runs `create_table_sql()`, runs `select_sql()`, and
+// hands the rows back to `rows_to_applied`.
+//
+// THE TABLE IS THE ONLY THING THIS PACKAGE WRITES TO A DATABASE, and
+// its shape is a compatibility promise the moment anybody uses it:
+//
+//   version     TEXT    PRIMARY KEY   the sequence — see `mgplan`
+//   name        TEXT    NOT NULL      the human name
+//   checksum    TEXT    NOT NULL      SHA-256 of `up`, lowercase hex
+//   applied_at  TEXT    NOT NULL      the driver's rendering of a time
+//   took_ms     INTEGER NOT NULL      0 when the runner did not measure
+//   succeeded   INTEGER NOT NULL      0 or 1 — see `MgApplied.succeeded`
+//
+// `TEXT` FOR THE VERSION AND NOT AN INTEGER, deliberately.  The
+// timestamp convention writes `20260911143000`, which fits in 64 bits
+// today and is a number nobody wants to read; the sequence convention
+// writes `0007`, whose leading zeros an integer column silently drops
+// and whose file name then stops matching its row.  Text keeps what
+// was written, and `mgplan.compare_versions` is what orders it.
+//
+// `TEXT` FOR THE TIME because this package has no clock and no
+// calendar.  The value is whatever the caller passes, and a caller
+// that wants it comparable passes an ISO-8601 string — which sorts
+// correctly as text, which is the whole reason ISO-8601 is written
+// that way.
+//
+// THE TABLE NAME IS AN ARGUMENT AND IS NOT INTERPOLATED FROM USER
+// INPUT.  Every function here takes it, because two applications
+// sharing a database need two tables, and because `sqlx` and
+// `alembic` each chose a different default and a port that hard-coded
+// either would be unable to read the other's.  `is_safe_table_name`
+// is the guard: an identifier this package will not quote, because
+// quoting an identifier is dialect-specific and query-builder-nv's
+// own notes record that even sql-engine-nv's tokenizer cannot do it.
+// So the name is CHECKED and refused rather than escaped.
+
+use mgerror
+use mgplan
+
+// The default table name: `schema_migrations`.
+//
+// Rails's name, which sqlx and half the ecosystem also use.
+// `alembic` uses `alembic_version` with a different shape entirely,
+// and a port that wanted to read one would need its columns rather
+// than its name.
+//
+// ```novo
+// use mgstate
+//
+// fn main() [io]
+//     println(mgstate.default_table())
+// ```
+pub fn default_table() -> Str
+    todo("migrate.mgstate.default_table")
+
+// True when a table name is one this package will put in a statement
+// unquoted: letters, digits and underscores, not starting with a
+// digit, at most 63 characters.
+//
+// THE GUARD, and it refuses rather than escapes — see the module
+// comment.  A name that fails this is a name the caller has to
+// change, which is a better outcome than a quoting rule that is right
+// for three dialects and wrong for the fourth.
+//
+// ```novo
+// use mgstate
+//
+// fn main() [io]
+//     println("${mgstate.is_safe_table_name("schema_migrations")}")
+// ```
+pub fn is_safe_table_name(name: Str) -> Bool
+    todo("migrate.mgstate.is_safe_table_name")
+
+// ── the statements ───────────────────────────────────────────────────
+
+// `CREATE TABLE IF NOT EXISTS` for the version table.
+//
+// The one piece of DDL this package emits, and it is written to the
+// intersection of SQLite's and PostgreSQL's dialects: `TEXT`,
+// `INTEGER`, `NOT NULL`, `PRIMARY KEY` and nothing else.  No
+// `SERIAL`, no `AUTOINCREMENT`, no `IF NOT EXISTS` on an index, and
+// no type a driver might spell differently.
+//
+// ```novo
+// use mgstate
+//
+// fn main() [io]
+//     match mgstate.create_table_sql(mgstate.default_table())
+//         Ok(sql) => println(sql)
+//         Err(_)  => println("bad table name")
+// ```
+pub fn create_table_sql(table: Str) -> Result<Str, mgerror.MgFault>
+    todo("migrate.mgstate.create_table_sql")
+
+// `SELECT` every applied migration, in version order.
+//
+// Ordered by the DATABASE and then re-sorted by
+// `mgplan.compare_versions`, because a database orders `"10"` before
+// `"9"` in a text column and this package's rule does not — see
+// `mgplan`.  The `ORDER BY` is there so the rows arrive in a stable
+// order for a reader watching them go past, and the re-sort is what
+// makes them correct.
+pub fn select_sql(table: Str) -> Result<Str, mgerror.MgFault>
+    todo("migrate.mgstate.select_sql")
+
+// `INSERT` one applied migration.
+//
+// Every value goes in as a PARAMETER and not into the string: the
+// name comes from a file name and the checksum from a hash, and
+// neither is something to concatenate into SQL.  `record_params` is
+// the values in the order the placeholders take them.
+//
+// The placeholder is the DRIVER's: SQLite writes `?`, PostgreSQL
+// writes `$1`, and this package cannot know which.  `placeholder` is
+// an argument for that reason, and `insert_sql` is what puts it in
+// the right places.
+//
+// ```novo
+// use mgstate
+//
+// fn main() [io]
+//     match mgstate.insert_sql(mgstate.default_table(), "?")
+//         Ok(sql) => println(sql)
+//         Err(_)  => println("bad table name")
+// ```
+pub fn insert_sql(table: Str, placeholder: Str) -> Result<Str, mgerror.MgFault>
+    todo("migrate.mgstate.insert_sql")
+
+// `DELETE` one applied migration, for a rollback.
+pub fn delete_sql(table: Str, placeholder: Str) -> Result<Str, mgerror.MgFault>
+    todo("migrate.mgstate.delete_sql")
+
+// The values an `insert_sql` statement takes, in placeholder order.
+//
+// Strings, because that is the intersection of what every driver's
+// parameter type can carry, and because `took_ms` and `succeeded`
+// both go into `INTEGER` columns that every dialect will coerce a
+// decimal string into.  A driver with a richer parameter type is free
+// to convert; one without is not stuck.
+//
+// ```novo
+// use mgstate
+// use mgplan
+// use std.list
+//
+// fn main() [io]
+//     let m = mgplan.migration("0001", "create_users", "CREATE TABLE t (n INT)", "")
+//     println("${list.len(mgstate.record_params(m, "2026-09-11T14:30:00Z", 12, true))}")
+// ```
+pub fn record_params(m: mgplan.MgMigration, applied_at: Str, took_ms: Int, succeeded: Bool) -> [Str]
+    todo("migrate.mgstate.record_params")
+
+// A numbered placeholder, for a driver that uses them: `$1` for
+// PostgreSQL, `?` for SQLite whatever the number.
+//
+// Published so a caller with a driver this package has not met can
+// say what its placeholders look like rather than building the SQL
+// itself.
+pub fn placeholder_for(style: Str, index: Int) -> Str
+    todo("migrate.mgstate.placeholder_for")
+
+// ── reading what came back ───────────────────────────────────────────
+
+// Turn the rows of a `select_sql` result into applied migrations.
+//
+// `rows` is one list of column values per row, as text — which is
+// what every driver can produce and the least this package can ask
+// for.  A row with the wrong number of columns is
+// `MgBadStateRow`, because the alternative is reading a checksum out
+// of a timestamp.
+//
+// The result is sorted by `mgplan.compare_versions`, not by the
+// order the database answered in — see `select_sql`.
+//
+// ```novo
+// use mgstate
+// use std.list
+//
+// fn main() [io]
+//     match mgstate.rows_to_applied([])
+//         Ok(a)  => println("${list.len(a)}")
+//         Err(_) => println("not this table")
+// ```
+pub fn rows_to_applied(rows: [[Str]]) -> Result<[mgplan.MgApplied], mgerror.MgFault>
+    todo("migrate.mgstate.rows_to_applied")
+
+// The column names `select_sql` asks for, in order.
+//
+// Published because a caller whose driver answers rows as a map
+// rather than a list needs to know which key is which, and because a
+// report about a bad row is more useful when it can name the column
+// that was missing.
+//
+// ```novo
+// use mgstate
+// use std.list
+//
+// fn main() [io]
+//     println("${list.len(mgstate.column_names())}")
+// ```
+pub fn column_names() -> [Str]
+    todo("migrate.mgstate.column_names")
+
+// One applied migration from a step that has just run.
+//
+// The bridge between `mgplan.MgStep` and the row to insert:
+// `applied_at` and `took_ms` are the caller's, because this package
+// has no clock.
+pub fn applied_of_step(s: mgplan.MgStep, applied_at: Str, took_ms: Int,
+                       succeeded: Bool) -> mgplan.MgApplied
+    todo("migrate.mgstate.applied_of_step")
+
+// ── the lock ─────────────────────────────────────────────────────────
+
+// `SELECT` that takes an advisory lock, for a driver that has one.
+//
+// TWO PROCESSES MIGRATING AT ONCE IS THE FAILURE NOBODY TESTS FOR,
+// and it is what happens the first time a deployment starts three
+// copies of a service at the same moment.  Without a lock all three
+// read an empty version table, all three run migration 1, and two of
+// them fail on a table that already exists — or, worse, succeed,
+// because the migration was written with `IF NOT EXISTS`.
+//
+// The mechanism is the driver's and there is no portable one:
+// PostgreSQL has `pg_advisory_lock`, MySQL has `GET_LOCK`, and SQLite
+// has the file lock it already takes.  So this answers the SQL for a
+// named style and empty for a driver with no such thing — and a
+// caller that gets empty knows it has to arrange exclusion itself
+// rather than assuming it has some.
+//
+// ```novo
+// use mgstate
+//
+// fn main() [io]
+//     println("${mgstate.lock_sql("postgres", 1) != ""}")
+// ```
+pub fn lock_sql(style: Str, key: Int) -> Str
+    todo("migrate.mgstate.lock_sql")
+
+// The statement that releases it, or empty.
+pub fn unlock_sql(style: Str, key: Int) -> Str
+    todo("migrate.mgstate.unlock_sql")
+
+// A lock key derived from the table name, so two applications sharing
+// a database do not exclude each other.
+//
+// The low 63 bits of the SHA-256 of the name, which is what sqlx does
+// and is stable across processes and machines — the property that
+// matters, since the point is that two PROCESSES agree.
+pub fn lock_key_for(table: Str) -> Int
+    todo("migrate.mgstate.lock_key_for")

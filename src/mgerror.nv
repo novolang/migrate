@@ -1,0 +1,115 @@
+// mgerror.nv — what stops a migration, and the one that stops it
+// BEFORE anything runs.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// EVERY FAULT HERE IS RAISED AT PLANNING TIME AND NOT AT RUNNING
+// TIME, which is the whole shape of this package.  A migration runner
+// that discovered a problem halfway through has left a database in a
+// state nobody designed: half the statements of version 7 applied,
+// version 7 not recorded, and no way to tell from the outside which
+// half.  So every question that can be answered before the first
+// statement is answered before the first statement, and `mgplan.plan`
+// answers a fault instead of a plan.
+//
+// `MgChecksumChanged` IS THE ONE THIS PACKAGE EXISTS FOR.  A
+// migration that has been applied and then EDITED is the single most
+// damaging thing that happens to a schema-migration setup, and it is
+// invisible: the developer who edited it has the new schema because
+// they re-ran from scratch, every machine that already applied the
+// old one has the old schema, and the version table says both are up
+// to date.  It surfaces months later as a column that exists on
+// staging and not in production.  The checksum is what makes it a
+// question with an answer, and the refusal is what makes the answer
+// arrive on the day of the edit.
+
+// What stopped a migration.
+pub enum MgFault
+    // A migration that has been applied no longer hashes to what it
+    // hashed to then.  THE FAULT THIS PACKAGE EXISTS FOR — see the
+    // module comment.  Carries both digests, because a report that
+    // said only "changed" leaves a reader unable to tell an edit from
+    // a line-ending conversion.
+    MgChecksumChanged(version: Str, applied_sha: Str, current_sha: Str)
+    // Two migrations claim the same version.  Refused rather than
+    // ordered arbitrarily: whichever ran first would be the one
+    // recorded, and the other would never run on any machine that had
+    // already migrated.
+    MgDuplicateVersion(version: Str, first_name: Str, second_name: Str)
+    // A migration appeared with a version BELOW the highest already
+    // applied.  Two developers branched, each added a migration, and
+    // one of them merged second.  Not automatically an error — the
+    // two may be independent — so `MgPlanOptions.allow_out_of_order`
+    // decides, and the default is to refuse, because the alternative
+    // is a schema whose final shape depends on the order two people
+    // happened to merge in.
+    MgOutOfOrder(version: Str, highest_applied: Str)
+    // The version table records a migration the directory does not
+    // contain.  Someone deleted a file, or the database belongs to a
+    // different application.  Refused, because a runner that ignored
+    // it cannot answer "is this database up to date" at all.
+    MgAppliedMissing(version: Str)
+    // A rollback was asked for and the migration has no `down`.
+    // Carried as its own variant because "this migration cannot be
+    // undone" is a design decision somebody made — a `DROP COLUMN`
+    // has no inverse that keeps the data — and the message should say
+    // so rather than reporting a missing field.
+    MgIrreversible(version: Str)
+    // A rollback was asked for past a migration that is irreversible,
+    // so the whole rollback is refused before the first statement.
+    MgRollbackBlocked(version: Str, target: Str)
+    // A file name does not match the convention: no version, no
+    // separator, or a direction this package does not know.
+    MgBadFileName(name: Str, detail: Str)
+    // A directory could not be read, or a file in it could not.
+    MgIoFailed(operation: Str, path: Str)
+    // A row of the version table did not have the columns it should.
+    // The table belongs to another tool, or to an older version of
+    // this one.
+    MgBadStateRow(detail: Str)
+    // A target version was named that no migration has.
+    MgNoSuchVersion(version: Str)
+
+// One line naming what went wrong, for a report a person reads.
+//
+// ```novo
+// use mgerror
+//
+// fn main() [io]
+//     println(mgerror.describe(mgerror.MgIrreversible(version: "0007")))
+// ```
+pub fn describe(f: MgFault) -> Str
+    todo("migrate.mgerror.describe")
+
+// The version a fault is about, or empty when it is about the
+// directory or the connection.
+//
+// What a report leads with: a person looking at a failed migration
+// wants the version first and the prose second.
+//
+// ```novo
+// use mgerror
+//
+// fn main() [io]
+//     println(mgerror.version_of(mgerror.MgNoSuchVersion(version: "0009")))
+// ```
+pub fn version_of(f: MgFault) -> Str
+    todo("migrate.mgerror.version_of")
+
+// True when this fault means a HUMAN has to decide something, rather
+// than something being retryable or fixable in place.
+//
+// `MgChecksumChanged`, `MgDuplicateVersion`, `MgOutOfOrder` and
+// `MgAppliedMissing` are all of them: each is two people's work
+// disagreeing, and no automatic resolution is right.  A deployment
+// pipeline branches on this to decide whether to fail loudly or
+// retry.
+//
+// ```novo
+// use mgerror
+//
+// fn main() [io]
+//     println("${mgerror.needs_a_person(mgerror.MgChecksumChanged(version: "7", applied_sha: "a", current_sha: "b"))}")
+// ```
+pub fn needs_a_person(f: MgFault) -> Bool
+    todo("migrate.mgerror.needs_a_person")
