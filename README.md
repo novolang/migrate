@@ -1,310 +1,336 @@
 # migrate
 
-**Status: NOT IMPLEMENTED — interface only.**
+A schema migration is one numbered change to a database's schema, kept
+in a file, applied once, and recorded in a table so that it is never
+applied twice. This package works out which of them a database still
+needs and in what order, and it produces the SQL for the table that
+records them. It runs nothing: the caller's own driver executes the
+statements. The shape is
+[sqlx's migrator](https://docs.rs/sqlx/latest/sqlx/migrate/index.html)
+for the files, the checksum and the table, and
+[alembic](https://alembic.sqlalchemy.org/en/latest/) for the up, down,
+status and stamp vocabulary.
 
-Every public function below is published with its signature and its
-effect row, and every body is `todo()`.  Installing this package works;
-calling it panics with `not implemented`.
+**Status: NOT IMPLEMENTED — interface only.** Every function is
+declared with its full signature, but every body is a `todo()` that
+panics when called. The package is published so its design can be
+reviewed and depended on before it is implemented. Version 0.1.0 will
+be the first working release.
 
-## What this is
+## What it is
 
-Versioned schema migrations for `std.sql` drivers — sqlx-migrate's and
-alembic's shape, in novo-lang.
+A **migration** has a **version**, a name, the statements that apply
+it, called the **up**, and the statements that undo it, called the
+**down**. The version is a sequence: `0007`, or a timestamp such as
+`20260911143000`. It is not a semantic version. The only question ever
+asked of two versions is which came first.
 
-A migration is a value, a plan is a value, and **running one is the
-caller's loop.**  This package reads the directory, computes the
-checksums, works out what would run and in what order, refuses when
-something is wrong, and produces the SQL for the version table.  It does
-not execute a statement.
+The **version table** is a table in the database being migrated. It
+holds one row per migration that has been applied. A migration is
+pending when it is in the directory and not in that table.
 
-Four modules, and a reader should know which one they are on.
+The **checksum** is the SHA-256 of a migration's up, recorded in the
+version table when the migration runs and compared against the file on
+every plan afterwards. It is what catches a migration that has been
+applied and then edited. That edit is invisible without it: the person
+who made it has the new schema, because they re-ran from an empty
+database, and every machine that already applied the old text has the
+old schema, while the version table says both are up to date.
 
-| surface | module | reach for it when |
+A **plan** is the ordered list of statements a run would execute, as a
+value. `mgplan.plan` answers one, or a refusal. It does not execute
+anything. Three things follow from that. A dry run is the same call as
+a real one, so the two cannot drift apart. Every refusal arrives
+before the first statement, so no database is left half-migrated.
+And the order can be asserted in a test with no database, no file and
+no clock in it.
+
+A **rollback** runs the downs in reverse. A migration whose down is
+empty is **irreversible**: a `DROP COLUMN` has no inverse that keeps
+the data. A rollback that would pass through one is refused before it
+starts.
+
+Only one module here touches the machine. `mgdir` lists a directory
+and reads files, and that is the whole of the package's `[fs]`.
+`mgplan`, `mgstate` and `mgerror` perform no input or output at all.
+Nothing here prints, and nothing here connects to a database.
+
+The version table has six columns, and its shape is a compatibility
+promise from the moment anything uses it.
+
+| Column | Type | Contents |
 | --- | --- | --- |
-| the **plan** | `mgplan` | anything. Start here |
-| the **version table** | `mgstate` | you need the SQL, or to read its rows |
-| the **directory** | `mgdir` | your migrations are files |
-| the **refusals** | `mgerror` | something stopped |
+| `version` | `TEXT PRIMARY KEY` | The sequence, as written in the file name |
+| `name` | `TEXT NOT NULL` | The human name |
+| `checksum` | `TEXT NOT NULL` | SHA-256 of the up, lowercase hex |
+| `applied_at` | `TEXT NOT NULL` | The caller's clock reading |
+| `took_ms` | `INTEGER NOT NULL` | 0 when the runner did not measure |
+| `succeeded` | `INTEGER NOT NULL` | 0 or 1 |
 
-## Adding it, and checking it
+The DDL is written to the intersection of SQLite's and PostgreSQL's
+dialects: `TEXT`, `INTEGER`, `NOT NULL` and `PRIMARY KEY`, and nothing
+else.
 
-```bash
-novo pkg add migrate             # into your novo.toml
-novo pkg build                   # type- and effect-check the package
-novo test --isolate tests/mgplan_tests.nv
+A directory is in one of two conventions, and `mgdir.detect` guesses
+which from what the directory holds.
+
+| Convention | Files | Where the down lives |
+| --- | --- | --- |
+| Paired | `0001_create_users.up.sql` and `0001_create_users.down.sql` | Its own file |
+| Single file | `0001_create_users.sql` | After a `-- +migrate Down` marker line in the same file |
+
+A version is everything before the first separator in the file name,
+and the separator is `__` or `_`. `V2__add_index.up.sql` is version
+`2`, named `add_index`.
+
+## Install
+
+```
+novo pkg add migrate
 ```
 
-`novo test` is red today and that is the point of the release: every
-assertion fails with `not implemented: migrate.<module>.<fn>`.  They
-turn green one at a time as bodies land.
-
-## The one example that will work
+## Example
 
 ```novo
 use mgdir
+use mgerror
 use mgplan
 use mgstate
 
-// What would run, and nothing runs.
-fn pending(dir: Str, applied_rows: [[Str]]) -> [Str] [fs]
-    match mgdir.read_auto(dir)
-        Err(f) => [mgerror.describe(f)]
-        Ok(ms) =>
-            match mgstate.rows_to_applied(applied_rows)
-                Err(f) => [mgerror.describe(f)]
+fn main() [io, fs]
+    // The rows the caller's own driver read back after running
+    // `mgstate.select_sql(mgstate.default_table())`. Empty here: this
+    // database has had nothing applied to it yet.
+    let rows: [[Str]] = []
+
+    // Read the migrations out of the directory, guessing the layout.
+    match mgdir.read_auto("migrations")
+        Err(f) => println(mgerror.describe(f))
+        Ok(available) =>
+            match mgstate.rows_to_applied(rows)
+                Err(f) => println(mgerror.describe(f))
                 Ok(applied) =>
-                    match mgplan.plan(ms, applied, mgplan.default_options())
-                        Err(f) => [mgerror.describe(f)]
-                        Ok(p)  => mgplan.render(p)
+                    // Work out what would run. Nothing runs: a refusal
+                    // arrives here, before the first statement.
+                    match mgplan.plan(available, applied, mgplan.default_options())
+                        Err(f) => println(mgerror.describe(f))
+                        Ok(p)  =>
+                            // The same plan a real run would execute,
+                            // one line per migration.
+                            for line in mgplan.render(p)
+                                println(line)
 ```
 
-The caller ran `mgstate.select_sql(...)` against its own database and
-handed the rows in.  To apply the plan it walks `p.steps`, runs each
-one's `sql`, and inserts the row `mgstate.record_params` builds.
+To apply the plan, walk `p.steps`, run each step's `sql` with your own
+driver, and insert the row `mgstate.record_params` builds.
 
-## The layer, and why
+Build and test with `novo pkg build` and `novo test`. Today `novo test`
+fails on purpose: every test reaches a
+`not implemented: migrate.<module>.<fn>` panic. The tests are the
+specification the implementation will have to satisfy.
 
-`host`, and **exactly one module earns it**: `mgdir`, which lists a
-directory and reads files.  `mgplan`, `mgstate` and `mgerror` are `[]`
-throughout.
+## What the package contains
 
-Nothing here prints, and nothing here connects to a database.
-
-## The load-bearing interface
-
-`mgplan.plan` — **it takes what the directory holds and what the
-database has applied, and answers an ordered list of statements, or a
-fault.  It runs nothing.**
-
-```novo norun:pseudo
-pub fn plan(available: [MgMigration], applied: [MgApplied],
-            options: MgPlanOptions) -> Result<MgPlan, mgerror.MgFault>
-```
-
-Three things fall out of that signature, and each is worth more than it
-looks:
-
-- **A dry run is the same call as a real one.**  There is no second code
-  path, so the thing a deployment reviews and the thing that runs cannot
-  drift apart.  "The dry run worked and the real one did not" is the
-  failure mode every migration tool with two paths has.
-- **Every refusal happens before the first statement.**  A runner that
-  discovered a changed checksum halfway has left half of version 7
-  applied and version 7 unrecorded, and nothing from the outside can
-  tell which half.
-- **The order is assertable with no database.**
-  `tests/mgplan_tests.nv` builds a directory's worth of migrations,
-  applies some, and asserts on what would run — no database, no file, no
-  clock.
-
-## Why this package does not run anything
-
-Two reasons, and the first is the language as it stands today.
-
-**A library that called `dyn Database` would be charged the union of
-every `Database` impl in the *consuming* program.**  SPEC § 5.6 is
-explicit: a `dyn Trait` call costs the union over every impl, because
-the call may land on any of them.  So:
-
-```novo norun:pseudo
-fn run(db: dyn Database) -> Str [fs]      // in a library
-    match db.exec("...")                   // charged [fs, io] today
-```
-
-fails to compile with `[fs]`, needs `[fs, io]` in a program whose only
-engine is the standard library's `SqliteDb` — and needs `[fs, io, net,
-time]` the moment that program adds postgres-nv.  **A library cannot
-declare a row that depends on what its consumer links.**  A migration
-runner that owned the loop would therefore be a library that stops
-compiling when somebody adds an engine, which is the opposite of
-engine-agnostic.
-
-The contract change that would lift it is the same one `Connection`
-records in its own header: **an effect parameter on `Database`** (`trait
-Database[e]`, SPEC § 5.6), so each impl supplies what it costs and a
-generic runner binds it — `fn run<D: Database[e]>(db: D, p: MgPlan) ->
-… [e]`.  That is a change to a vendor-connect contract and belongs in a
-feature file; this package names it rather than working around it, and
-it is the widening this lane found.
-
-**The second reason is that the plan shape is better anyway**, and the
-three bullets above are why.  When the contract change lands, this
-package grows a convenience runner *on top of* `plan` — and `plan` stays
-exactly as it is.
-
-## The refusal this package exists for
-
-**A migration that has been applied and then edited.**
-
-It is invisible without a checksum: the developer who edited it has the
-new schema, because they re-ran from an empty database; every machine
-that already applied the old one has the old schema; and the version
-table says both are up to date.  It surfaces months later as a column
-that exists on staging and not in production.
-
-`MgMigration.checksum` is the SHA-256 of the migration's `up`, recorded
-in the version table when it runs and compared on every plan afterwards.
-`mgerror.MgChecksumChanged` carries **both** digests, because a report
-that said only "changed" leaves a reader unable to tell an edit from a
-line-ending conversion.
-
-The checksum is over `up` **alone**.  Editing a `down` that has never
-run changes nothing that has happened, and refusing for it would make
-fixing a broken rollback impossible without rewriting history.
-
-Three more refusals, all at planning time and all needing a person:
-
-| | |
+| Module | Contents |
 | --- | --- |
-| two migrations claim one version | whichever ran first would be recorded, and the other would never run on any machine that had already migrated |
-| a migration arrives below the highest applied | two people branched and merged in either order, and the schema's final shape must not depend on which merged second — `allow_out_of_order` is the switch, and it is off |
-| the version table names a migration the directory does not have | a runner that ignored it cannot answer "is this database up to date" at all |
+| `mgplan` | The migration, the plan, the version ordering, the planner for an up, a down and a redo, and the status report. |
+| `mgstate` | The version table: the SQL that creates it, reads it, inserts into it and deletes from it, the parsing of the rows it answers, and the advisory-lock statements. |
+| `mgdir` | The two directory conventions: parsing a file name, splitting a single file at its markers, reading a directory, and writing a new migration's files. |
+| `mgerror` | Every reason a plan is refused, the sentence for each, and which of them need a person rather than a retry. |
 
-And one refusal on the way down: **a rollback through an irreversible
-migration does not start.**  A `DROP COLUMN` has no inverse that keeps
-the data, so `MgMigration.down` is allowed to be empty — and a rollback
-that stopped halfway would leave a schema nobody has a name for.
+## How to choose an entry point
 
-## A schema version is a sequence, not a semver
+**`mgplan.plan` is the ordinary call.** It answers what an upgrade
+would run. `mgplan.plan_down` answers what a rollback to a given
+version would run, in reverse order. `mgplan.plan_redo` undoes the
+last applied migration and re-applies it, which is the development
+loop and the one place a down is exercised often enough to be trusted.
 
-The plan asked for this in writing, so here it is.
+**`mgplan.status` answers instead of refusing.** `plan` raises on a
+changed checksum, because a run must not proceed. `status` reports the
+same fact as an `MgModified` row, because it is the call a person
+makes when something is already wrong.
 
-changelog-nv takes **semver-nv** because a release version *is* a
-semantic version: three numbers with rules about which one moves when, a
-pre-release ordering, and a caret range that decides compatibility.
+**`mgdir.read_auto` guesses the directory's convention;
+`mgdir.read` takes it as an argument.** Use `read_auto` on a directory
+somebody else created. Use `read` when your project has decided.
 
-A schema version is none of that.  It is `20260911143000` or `0007`; it
-compares by ordinary ordering; it has no pre-release and no build
-metadata; nothing is "compatible" with it; and the only question ever
-asked of two of them is which came first.  Modelling it as a semantic
-version would invite exactly the question that has no meaning here —
-whether migration `2.0.0` is a breaking change.
+**`mgstate` is for a caller with its own driver.** `create_table_sql`,
+`select_sql`, `insert_sql` and `delete_sql` produce the statements;
+`record_params` produces the values; `rows_to_applied` parses what
+comes back. A caller whose driver takes numbered placeholders passes
+`placeholder_for("postgres", n)` rather than building the SQL itself.
 
-So `MgVersion` is a `Str`, and `mgplan.compare_versions` is where the
-sequence's own rule lives.  **That rule is public because there is
-exactly one way to get it wrong and it is late:** comparing `"10"` and
-`"9"` as text sorts `10` first and runs the migrations in the wrong
-order on exactly the tenth one — by which point every test suite has
-passed.
+## The rules a user needs
 
-## The version table
+1. **Nothing here runs a statement.** `plan` answers a value and the
+   caller's driver executes it. The reason is a language rule: a
+   library that called a database through a `dyn` trait would be
+   charged the union of the effects of every driver in the consuming
+   program (SPEC section 5.6), so its declared effects would change
+   when the program added an engine. An effect parameter on the
+   database trait is the change that would allow a runner here, and it
+   has not landed.
+2. **Compare versions with `mgplan.compare_versions`, never as text.**
+   A version that is all digits compares numerically, so `"10"` comes
+   after `"9"`. Text order puts `10` first and runs the migrations in
+   the wrong order on exactly the tenth one, which is late enough that
+   every test suite has passed.
+3. **A version is a `Str`, and the column is `TEXT`.** The sequence
+   convention writes `0007`, and an integer column silently drops the
+   leading zeros, after which the file name no longer matches its row.
+4. **The checksum is over the up alone.** Editing a down that has
+   never run changes nothing that has happened. Refusing for it would
+   make fixing a broken rollback impossible without rewriting the
+   applied history.
+5. **Every refusal arrives before the first statement.** A run that
+   discovered a problem halfway has left half of version 7 applied and
+   version 7 unrecorded, and nothing from the outside can tell which
+   half.
+6. **A file that does not parse stops the read.** It is not skipped. A
+   migration silently skipped is a migration that runs on one machine
+   and not on another. `MgBadFileName` names the file and what was
+   wrong with it.
+7. **The read is sorted by version, not by the directory.** A
+   filesystem answers names in whatever order it likes, and even a
+   sorted one puts `10` before `9`. `rows_to_applied` re-sorts the
+   database's answer for the same reason.
+8. **A migration below the highest applied version is refused by
+   default.** Two people branched, each added a migration, and one
+   merged second. `MgPlanOptions.allow_out_of_order` turns the refusal
+   off. Leaving it off is what keeps the schema's final shape from
+   depending on the order two people happened to merge in.
+9. **The applied time is the caller's string.** This package has no
+   clock and no calendar. A caller that wants the column to sort
+   correctly passes an ISO-8601 string, which is why ISO-8601 is
+   written the way it is.
+10. **The table name is checked, not quoted.**
+    `mgstate.is_safe_table_name` accepts letters, digits and
+    underscores, not starting with a digit, up to 63 characters.
+    Anything else is refused, because quoting an identifier is
+    dialect-specific.
+11. **Every value goes into a statement as a parameter.** The name
+    comes from a file name and the checksum from a hash, and neither
+    is concatenated into SQL. The placeholder is the driver's: SQLite
+    writes `?` and PostgreSQL writes `$1`, so `insert_sql` takes it as
+    an argument.
+12. **There is no portable lock, and `mgstate.lock_sql` answers empty
+    when there is none.** Three copies of a service starting at once
+    all read an empty version table and all run migration 1.
+    PostgreSQL has `pg_advisory_lock` and MySQL has `GET_LOCK`;
+    SQLite's own file lock already does it. A caller that gets an
+    empty statement back knows it has to arrange exclusion itself.
+    `mgstate.lock_key_for` derives the key from the table name, so two
+    applications sharing a database do not exclude each other.
+13. **A rollback through an irreversible migration does not start.**
+    `MgMigration.down` is allowed to be empty, and
+    `mgerror.MgRollbackBlocked` is what a rollback past one answers.
+14. **One step is one migration, not one statement.** Splitting SQL
+    into statements needs a parser, and this package does not have
+    one. A driver that cannot run several statements in one call has a
+    caller who will have to split them, and that caller knows the
+    dialect.
 
-Six columns, and its shape is a compatibility promise the moment
-anybody uses it:
+Five refusals stop a plan, and each of them needs a person.
 
-| column | type | |
-| --- | --- | --- |
-| `version` | `TEXT PRIMARY KEY` | the sequence |
-| `name` | `TEXT NOT NULL` | the human name |
-| `checksum` | `TEXT NOT NULL` | SHA-256 of `up`, lowercase hex |
-| `applied_at` | `TEXT NOT NULL` | the caller's clock reading |
-| `took_ms` | `INTEGER NOT NULL` | 0 when unmeasured |
-| `succeeded` | `INTEGER NOT NULL` | 0 or 1 |
+| Refusal | What happened |
+| --- | --- |
+| `MgChecksumChanged` | An applied migration's text has been edited. Carries both digests, so a reader can tell an edit from a line-ending conversion |
+| `MgDuplicateVersion` | Two migrations claim one version. Whichever ran first would be recorded and the other would never run |
+| `MgOutOfOrder` | A migration arrived below the highest applied version. See rule 8 |
+| `MgAppliedMissing` | The version table names a migration the directory does not have |
+| `MgRollbackBlocked` | A rollback would pass through an irreversible migration |
 
-**`TEXT` for the version and not an integer**, deliberately: the
-timestamp convention writes a number nobody wants to read, and the
-sequence convention writes `0007`, whose leading zeros an integer column
-silently drops — after which the file name stops matching its row.
+## What is not included
 
-**`TEXT` for the time** because this package has no clock and no
-calendar.  The value is the caller's; a caller that wants it comparable
-passes ISO-8601, which sorts correctly as text, which is why ISO-8601 is
-written that way.
+- **Running anything.** See rule 1. When the database trait takes an
+  effect parameter, a runner is added on top of `plan`, and `plan`
+  does not change.
+- **Parsing SQL.** A migration's body is text the driver runs. A
+  parser here would refuse valid statements for whichever dialect it
+  did not implement, and the driver is going to parse the text anyway.
+- **A clock.** The applied time is an argument. See rule 9.
+- **Printing.** Every report is a list of strings, and the program
+  decides where they go.
+- **Generating a migration from a schema difference.** Alembic's
+  autogenerate introspects a live database and compares it with a
+  model definition. Both halves are packages that do not exist yet.
+- **Transactional migrations.** Whether a migration runs inside a
+  transaction is the driver's decision and the dialect's: PostgreSQL
+  can run DDL in one and MySQL cannot. The caller decides, and
+  `MgApplied.succeeded` records a migration that failed partway when
+  it could not.
+- **Repeatable migrations and seed data.** Flyway's `R__` prefix
+  re-runs a file whenever its checksum changes, which is the opposite
+  of rule 4.
+- **A semantic version for the schema.** A schema version has no
+  pre-release, no build metadata and no compatibility rule. Modelling
+  it as a semantic version invites the question of whether migration
+  `2.0.0` is a breaking change, which has no meaning.
 
-**The table name is an argument and is checked rather than escaped.**
-Two applications sharing a database need two tables, and sqlx and
-alembic each chose a different default.  `mgstate.is_safe_table_name`
-refuses anything that would need quoting — because quoting an identifier
-is dialect-specific, and query-builder-nv's own notes record that even
-sql-engine-nv's tokenizer cannot do it.
+## Related packages
 
-**Two processes migrating at once is the failure nobody tests for**, and
-it is what happens the first time a deployment starts three copies of a
-service at the same moment: all three read an empty version table, all
-three run migration 1.  There is no portable advisory lock —
-PostgreSQL has `pg_advisory_lock`, MySQL has `GET_LOCK`, SQLite has the
-file lock it already takes — so `mgstate.lock_sql` answers the statement
-for a named style and **empty** for a driver with no such thing.  A
-caller that gets empty knows it has to arrange exclusion itself, rather
-than assuming it has some.
+- [postgres-nv](https://novo-lang.org/packages/postgres-nv),
+  [mysql-nv](https://novo-lang.org/packages/mysql-nv) and
+  [sqlite-nv](https://novo-lang.org/packages/sqlite-nv) are the
+  drivers that run what this package plans. Each one's parameter
+  placeholder is what `mgstate.placeholder_for` names.
+- [query-builder-nv](https://novo-lang.org/packages/query-builder-nv)
+  builds SELECT, INSERT, UPDATE and DELETE as values, for the queries
+  an application runs. This package builds the four statements the
+  version table needs and nothing else.
+- [crypto-nv](https://novo-lang.org/packages/crypto-nv) is the
+  SHA-256 behind every checksum here, and behind the advisory-lock
+  key.
+- `std.sql` in the standard library opens an SQLite database and runs
+  statements against it. It is the driver a first program uses with
+  this package.
 
-## The directory, both conventions
+## Tests
 
-A port that picked one convention could not read the other's directory,
-so both are here and `mgdir.detect` guesses — because the realistic
-first use of this package is pointing it at a directory somebody else
-created.
+```bash
+novo test tests/mgplan_tests.nv   # the planner, the ordering and the refusals
+novo test tests/mghost_tests.nv   # the directory conventions and the version table
+```
 
-- **paired** — `0001_create_users.up.sql` and `.down.sql`.  sqlx's
-  default, and the one where a `down` is a first-class file.
-- **single file** — `0001_create_users.sql` with `-- +migrate Up` and
-  `-- +migrate Down` markers.  One file, which keeps a migration and its
-  inverse together — and which means a **mistyped marker silently
-  produces a migration with no `down`**, so `mgdir.split_markers`
-  reports which markers it actually saw rather than assuming.
+The reference implementations are sqlx's migrator for the file
+conventions, the checksum rule and the table's shape, and alembic for
+the up, down, status and stamp vocabulary. The single-file markers
+`-- +migrate Up` and `-- +migrate Down` are sql-migrate's and goose's
+spelling.
 
-A file that does not parse **stops the read** rather than being skipped.
-A migration silently skipped is a migration that runs on one machine and
-not on another, which is the class of failure this whole package exists
-to make impossible.
+No test opens a database. A suite builds a directory's worth of
+migrations as values, declares some of them applied, and asserts on
+what would run. The suite checks that `"10"` plans after `"9"`, that
+an edited migration is refused rather than re-run, that two migrations
+claiming one version are refused, that a migration below the highest
+applied is refused unless the option is set, that a rollback through
+an irreversible migration does not start, and that a file name that
+does not parse stops the read instead of being skipped.
 
-The read is sorted by `mgplan.compare_versions` and **not** by the
-directory: a filesystem answers names in whatever order it likes, and
-even a sorted one puts `10` before `9`.
+The tests compile today and fail at run, each on the
+`not implemented: migrate.<module>.<fn>` panic that is its body. That
+is the expected state of an interface release. They turn green one at
+a time as bodies land.
 
-## One dependency, and two refusals
+## Implementation status
 
-**crypto-nv**, for SHA-256, and it is the whole reason this package can
-refuse anything.
+| Item | Implemented |
+| --- | --- |
+| `mgplan.default_options`, `.compare_versions`, `.sorted` | no |
+| `mgplan.migration`, `.checksum_of`, `.is_reversible` | no |
+| `mgplan.plan`, `.plan_down`, `.plan_redo`, `.is_empty`, `.render` | no |
+| `mgplan.status`, `.current_version`, `.is_up_to_date`, `.render_status` | no |
+| `mgstate.default_table`, `.is_safe_table_name`, `.column_names` | no |
+| `mgstate.create_table_sql`, `.select_sql`, `.insert_sql`, `.delete_sql` | no |
+| `mgstate.record_params`, `.placeholder_for`, `.rows_to_applied`, `.applied_of_step` | no |
+| `mgstate.lock_sql`, `.unlock_sql`, `.lock_key_for` | no |
+| `mgdir.up_marker`, `.down_marker`, `.parse_name`, `.file_name_for`, `.split_markers` | no |
+| `mgdir.detect`, `.read`, `.read_auto`, `.create`, `.next_sequence` | no |
+| `mgerror.describe`, `.version_of`, `.needs_a_person` | no |
 
-**Not semver-nv** — see above.
+## Licence
 
-**Not sql-engine-nv.**  This package does not parse SQL: a migration's
-body is text the driver runs, and a parser here would refuse valid
-statements for whichever dialect it did not implement while adding
-nothing — the driver is going to parse it anyway, and its error message
-is the one a caller can act on.  It is also why an `MgStep` is one
-migration and not one statement: splitting SQL into statements needs a
-parser, and a driver that cannot run several statements at once has a
-caller who will need the dialect to split them.
+Apache-2.0. See `LICENSE`.
 
-## What is out of scope, out loud
-
-**Running anything** — see above, and it is the first thing to revisit
-when `Database` takes an effect parameter.
-
-**Generating migrations from a schema diff.**  alembic's autogenerate
-needs to introspect a live database and compare it with a model
-definition, which is two packages this grid does not have yet.
-
-**Transactional migrations.**  Whether a migration runs inside a
-transaction is the driver's decision and the dialect's — PostgreSQL can
-do DDL in one and MySQL cannot — so the caller decides, and
-`MgApplied.succeeded` is what records a migration that failed partway
-when it could not.
-
-**Seed data and repeatable migrations.**  Flyway's `R__` prefix runs a
-file whenever its checksum changes, which is the opposite of this
-package's central rule; it is a real feature and it wants its own
-decision rather than an inversion of this one.
-
-## The reference implementations
-
-sqlx-migrate for the directory conventions, the checksum rule and the
-version table's shape; alembic for the up/down/status/stamp vocabulary.
-
-The implementation lane's gate is a real database and a real directory:
-a corpus of migration directories from both conventions, applied against
-the standard library's `SqliteDb`, with the version table read back and
-compared.
-
-## Status
-
-Interface only.  Four modules, 42 public functions, every body a
-`todo()`.
-
-- `novo pkg build` — clean, 4 modules checked.
-- `novo test` — two suites, all red, every failure `not implemented`.
-- `scripts/shard_audit.sh --strict` — `effect-budget`, `dep-layer`,
-  `no-discharge-in-core`, `doc-examples` and `docs-pub` green; `test`
-  red by design.
+<!-- docs/writing-a-readme.md is the style guide for this page. -->

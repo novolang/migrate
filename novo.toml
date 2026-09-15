@@ -1,6 +1,6 @@
 [package]
 name        = "migrate"
-version     = "0.0.1"
+version     = "0.0.2"
 description = "Versioned schema migrations for std.sql drivers: a migration is a value, a plan is a value, and running one is the caller's loop.  The applied-versions table with checksums, up/down/redo/status, a dry run that is the same call as a real one, and a plan that refuses before it runs when a checksum has changed.  Interface only — every body is a todo()."
 license     = "Apache-2.0"
 
