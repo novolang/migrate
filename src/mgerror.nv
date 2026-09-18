@@ -70,6 +70,17 @@ pub enum MgFault
     // A target version was named that no migration has.
     MgNoSuchVersion(version: Str)
 
+// `MgFault` is an `Error`, which is what lets `Result<T, MgFault>`
+// exist at all — every fallible signature in `mgdir`, `mgplan` and
+// `mgstate` answers with one.
+impl Error for MgFault
+    // The one-line message: `mgerror.describe`'s sentence, the fault
+    // named with the version it is about.
+    //
+    // Panics with `not implemented` until the bodies land.
+    fn message(self) -> Str
+        todo("migrate.MgFault.message")
+
 // One line naming what went wrong, for a report a person reads.
 //
 // ```novo
